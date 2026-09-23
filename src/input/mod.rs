@@ -866,9 +866,28 @@ impl State {
                             Some(PointerFocusTarget::ResizeFork(_))
                         );
                         if let Some(target) = under.filter(|_| !on_resize_fork) {
+                            // Funnel: on strongly shrunk windows a plain left click moves the window.
+                            let funnel_drag = matches!(
+                                event.button(),
+                                Some(smithay::backend::input::MouseButton::Left)
+                            ) && target.toplevel().is_some_and(|surface| {
+                                let shell = self.common.shell.read();
+                                shell.element_for_surface(&*surface).is_some_and(|elem| {
+                                    shell
+                                        .space_for(elem)
+                                        .and_then(|w| w.floating_layer.funnel_scale_of(elem))
+                                        .is_some_and(|s| {
+                                            crate::shell::funnel::is_move_anywhere(
+                                                smithay::desktop::space::SpaceElement::geometry(elem).size.w,
+                                                s,
+                                            )
+                                        })
+                                })
+                            });
                             if let Some(surface) = target.toplevel().map(Cow::into_owned)
-                                && self.source_modifiers(&backend_id, &seat).logo
-                                && !shortcuts_inhibited
+                                && ((self.source_modifiers(&backend_id, &seat).logo
+                                    && !shortcuts_inhibited)
+                                    || funnel_drag)
                             {
                                 let seat_clone = seat.clone();
                                 let mouse_button = event.button();

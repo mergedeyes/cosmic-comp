@@ -3897,6 +3897,21 @@ impl Shell {
                 let elem_geo = element_geo.or_else(|| workspace.element_geometry(&old_mapped))?;
                 let mut initial_window_location = elem_geo.loc.to_global(workspace.output());
 
+                // Funnel: the window is drawn shrunk around its center, while the move grab
+                // shrinks it around the cursor. Choose the grab's (unscaled) window location
+                // so both agree and the window does not jump when the drag starts.
+                if let Some(s) = workspace.floating_layer.funnel_scale_of(&old_mapped) {
+                    let geo = elem_geo.to_f64();
+                    let c = geo.loc + geo.size.downscale(2.0);
+                    let visual_tl = c + (geo.loc - c).upscale(s);
+                    let cursor = start_data
+                        .location()
+                        .as_global()
+                        .to_local(workspace.output());
+                    let tl = cursor + (visual_tl - cursor).downscale(s);
+                    initial_window_location = tl.to_i32_round().to_global(workspace.output());
+                }
+
                 let mut new_size = if old_mapped.maximized_state.lock().unwrap().is_some() {
                     // If surface is maximized then unmaximize it
                     workspace
@@ -4551,6 +4566,14 @@ impl Shell {
             check_grab_preconditions(seat, serial, client_initiated.then_some(surface))?;
         let mapped = self.element_for_surface(surface).cloned()?;
         if mapped.is_maximized(true) {
+            return None;
+        }
+
+        // Funnel prototype: no resizing while a window is drawn shrunk.
+        if self
+            .space_for(&mapped)
+            .is_some_and(|w| w.floating_layer.funnel_scale_of(&mapped).is_some())
+        {
             return None;
         }
 

@@ -143,6 +143,7 @@ pub enum Usage {
     PotentialGroupIndicator,
     SnappingIndicator,
     Border,
+    FunnelMoveOnly,
 }
 
 #[derive(Clone)]

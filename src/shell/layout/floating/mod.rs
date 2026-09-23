@@ -57,6 +57,11 @@ pub struct FloatingLayout {
     pub(crate) space: Space<CosmicMapped>,
     last_output_size: Size<i32, Local>,
     spawn_order: Vec<CosmicMapped>,
+    /// Windows docked to the left/right edge (roadmap item 2), nearest-edge
+    /// first, stacked top to bottom. A docked window is just a normal floating
+    /// element whose position happens to sit at (or past) the funnel edge.
+    docked_left: Vec<CosmicMapped>,
+    docked_right: Vec<CosmicMapped>,
     animations: HashMap<CosmicMapped, Animation>,
     hovered_stack: Option<(CosmicMapped, Rectangle<i32, Local>)>,
     dirty: AtomicBool,
@@ -667,6 +672,10 @@ impl FloatingLayout {
         window: &CosmicMapped,
         to: Option<Rectangle<i32, Local>>,
     ) -> Option<Rectangle<i32, Local>> {
+        // If this was docked, free its slot and let the rest of that edge's
+        // stack close the gap before we do anything else with it.
+        self.undock(window);
+
         let mut mapped_geometry = self.space.element_geometry(window).map(RectExt::as_local)?;
         let _ = self.animations.remove(window);
 
@@ -739,8 +748,109 @@ impl FloatingLayout {
         }
     }
 
+    /// Dock `window` into the next free slot on `side` (roadmap item 2).
+    /// Slots stack top to bottom from the top of the output's non-exclusive
+    /// zone; existing slots on that edge are left in place, the new window
+    /// goes at the bottom of the stack.
+    pub fn dock_window(
+        &mut self,
+        window: CosmicMapped,
+        side: crate::shell::funnel::DockSide,
+    ) -> (CosmicMapped, Point<i32, Local>) {
+        use crate::shell::funnel::DockSide;
+
+        if self
+            .hovered_stack
+            .as_ref()
+            .is_some_and(|(stack, _)| stack == &window || !stack.alive())
+        {
+            let _ = self.hovered_stack.take();
+        }
+
+        self.docked_left.retain(|w| w != &window);
+        self.docked_right.retain(|w| w != &window);
+        match side {
+            DockSide::Left => self.docked_left.push(window.clone()),
+            DockSide::Right => self.docked_right.push(window.clone()),
+        }
+        self.reflow_docked(side);
+
+        let position = self
+            .space
+            .element_geometry(&window)
+            .map(RectExt::as_local)
+            .map(|geo| geo.loc)
+            .unwrap();
+        (window, position)
+    }
+
+    /// Remove `window` from the docked lists, if it is in either of them, and
+    /// reflow the remaining slots on that edge so there is no gap left behind.
+    fn undock(&mut self, window: &CosmicMapped) {
+        use crate::shell::funnel::DockSide;
+
+        if let Some(pos) = self.docked_left.iter().position(|w| w == window) {
+            self.docked_left.remove(pos);
+            self.reflow_docked(DockSide::Left);
+        } else if let Some(pos) = self.docked_right.iter().position(|w| w == window) {
+            self.docked_right.remove(pos);
+            self.reflow_docked(DockSide::Right);
+        }
+    }
+
+    /// Recompute and apply the geometry of every window currently docked on
+    /// `side`, in order, stacked from the top of the output with `DOCK_GAP`
+    /// between slots. A docked window's x places its *center* exactly on (or
+    /// past) the output edge, which is what already gives it `MIN_SCALE` in
+    /// the funnel render/hit-testing code -- docking needs no separate
+    /// render path, only this placement.
+    fn reflow_docked(&mut self, side: crate::shell::funnel::DockSide) {
+        use crate::shell::funnel::DockSide;
+
+        let list = match side {
+            DockSide::Left => self.docked_left.clone(),
+            DockSide::Right => self.docked_right.clone(),
+        };
+        let output = self.space.outputs().next().unwrap().clone();
+        let mut y_offset = 0;
+        for w in list {
+            if !w.alive() {
+                continue;
+            }
+            let output_geometry = {
+                let layers = layer_map_for_output(&output);
+                layers.non_exclusive_zone()
+            };
+            let size = w.geometry().size;
+            let x = match side {
+                DockSide::Left => -(size.w / 2),
+                DockSide::Right => output_geometry.loc.x + output_geometry.size.w - size.w / 2,
+            };
+            let position = Point::<i32, Local>::from((x, output_geometry.loc.y + y_offset));
+            self.map_internal(w.clone(), Some(position), None, None);
+            y_offset += (size.h as f64 * crate::shell::funnel::MIN_SCALE).round() as i32
+                + crate::shell::funnel::DOCK_GAP;
+        }
+    }
+
     pub fn element_geometry(&self, elem: &CosmicMapped) -> Option<Rectangle<i32, Local>> {
         self.space.element_geometry(elem).map(RectExt::as_local)
+    }
+
+    /// Width of the output the funnel is evaluated against. Read live from the
+    /// output instead of the cached `last_output_size`, which is only refreshed in
+    /// `recalculate()` and can lag behind a mode change.
+    fn funnel_output_width(&self) -> f64 {
+        self.space
+            .outputs()
+            .next()
+            .map(|o| o.geometry().size.w as f64)
+            .unwrap_or(self.last_output_size.w as f64)
+    }
+
+    /// Funnel scale of a floating element, or None if it is drawn at full size.
+    pub fn funnel_scale_of(&self, elem: &CosmicMapped) -> Option<f64> {
+        self.funnel_params(elem).map(|(_, s)| s)
     }
 
     /// Funnel transform of a (non-animating) floating element:
@@ -755,7 +865,7 @@ impl FloatingLayout {
             geo.loc.y as f64 + geo.size.h as f64 / 2.0,
         )
             .into();
-        let s = crate::shell::funnel::scale_at(c.x, self.last_output_size.w as f64);
+        let s = crate::shell::funnel::scale_at(c.x, self.funnel_output_width());
         (s < 0.999).then_some((c, s))
     }
 
@@ -1593,7 +1703,7 @@ impl FloatingLayout {
                     let center_y = geometry.loc.y as f64 + geometry.size.h as f64 / 2.0;
                     let s = crate::shell::funnel::scale_at(
                         center_x,
-                        self.last_output_size.w as f64,
+                        self.funnel_output_width(),
                     );
                     if s < 0.999 {
                         let w = (geometry.size.w as f64 * s).round() as i32;
@@ -1639,7 +1749,31 @@ impl FloatingLayout {
                 }
             });
 
-            if focused == Some(elem) && !elem.is_maximized(false) {
+            // Funnel: windows too small to use only accept moves; mark them with a
+            // blue outline (instead of the normal focus hint, so the meaning is clear).
+            let move_only = self.funnel_scale_of(elem).is_some_and(|s| {
+                crate::shell::funnel::is_move_anywhere(elem.geometry().size.w, s)
+            });
+            if move_only {
+                let thickness =
+                    indicator_thickness.max(crate::shell::funnel::MOVE_ONLY_THICKNESS);
+                let radius = elem.corner_radius(geometry.size.as_logical(), thickness);
+                push(
+                    IndicatorShader::focus_element(
+                        renderer,
+                        Key::Window(Usage::FunnelMoveOnly, elem.key()),
+                        geometry,
+                        thickness,
+                        radius,
+                        alpha,
+                        output_scale,
+                        crate::shell::funnel::MOVE_ONLY_COLOR,
+                    )
+                    .into(),
+                );
+            }
+
+            if focused == Some(elem) && !elem.is_maximized(false) && !move_only {
                 let active_window_hint = crate::theme::active_window_hint(theme);
                 let radius = elem.corner_radius(geometry.size.as_logical(), indicator_thickness);
 

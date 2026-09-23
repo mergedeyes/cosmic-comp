@@ -49,7 +49,16 @@ pub struct WinitState {
 impl WinitState {
     #[profiling::function]
     pub fn render_output(&mut self, state: &mut Common) -> Result<()> {
-        let age = self.backend.buffer_age().unwrap_or(0);
+        // Funnel prototype: some nested setups report bogus buffer ages or mishandle
+        // partial-damage swaps, which shows up as flicker. COSMIC_WINIT_FULL_REDRAW=1
+        // redraws and presents the whole frame every time.
+        let full_redraw =
+            std::env::var_os("COSMIC_WINIT_FULL_REDRAW").is_some_and(|v| v != "0");
+        let age = if full_redraw {
+            0
+        } else {
+            self.backend.buffer_age().unwrap_or(0)
+        };
         let (renderer, mut fb) = self
             .backend
             .bind()
@@ -70,7 +79,11 @@ impl WinitState {
             Ok(RenderOutputResult { damage, states, .. }) => {
                 std::mem::drop(fb);
                 self.backend
-                    .submit(damage.map(|x| x.as_slice()))
+                    .submit(if full_redraw {
+                        None
+                    } else {
+                        damage.map(|x| x.as_slice())
+                    })
                     .with_context(|| "Failed to submit buffer for display")?;
                 state.send_frames(&self.output, None);
                 state.update_primary_output(&self.output, &states);

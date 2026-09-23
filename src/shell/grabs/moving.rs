@@ -191,11 +191,18 @@ impl MoveGrabState {
                     radius,
                     alpha,
                     output_scale.x,
-                    [
-                        active_window_hint.red,
-                        active_window_hint.green,
-                        active_window_hint.blue,
-                    ],
+                    if crate::shell::funnel::is_move_anywhere(
+                        self.window.geometry().size.w,
+                        scale,
+                    ) {
+                        crate::shell::funnel::MOVE_ONLY_COLOR
+                    } else {
+                        [
+                            active_window_hint.red,
+                            active_window_hint.green,
+                            active_window_hint.blue,
+                        ]
+                    },
                 )
                 .into(),
             )
@@ -976,19 +983,48 @@ impl Drop for MoveGrab {
                             Some((window, location.to_global(&output)))
                         }
                         _ => {
+                            // Funnel scale + visual center the window would be drawn at if
+                            // dropped right here (both needed either way: to decide docking,
+                            // or to place it normally below).
+                            let s = grab_state.funnel_scale();
+                            let size = grab_state.window.geometry().size.to_f64();
+                            let vc_x = grab_state.location.x
+                                + (grab_state.window_offset.x as f64 + size.w / 2.0) * s;
+                            let vc_y = grab_state.location.y
+                                + (grab_state.window_offset.y as f64 + size.h / 2.0) * s;
+
+                            // Roadmap item 2 ("Docking"): dropped small enough (and not on
+                            // one of the Maximize/Top/Bottom snap zones), the window docks to
+                            // whichever edge its visual center is nearer, instead of staying
+                            // wherever it was dropped.
+                            let dock_side = (matches!(previous, ManagedLayer::Floating)
+                                && grab_state.snapping_zone.is_none()
+                                && crate::shell::funnel::is_dockable(
+                                    grab_state.window.geometry().size.w,
+                                    s,
+                                ))
+                            .then(|| {
+                                let output_geom = output.geometry().to_f64().as_logical();
+                                let mid_x = output_geom.loc.x + output_geom.size.w / 2.0;
+                                if vc_x < mid_x {
+                                    crate::shell::funnel::DockSide::Left
+                                } else {
+                                    crate::shell::funnel::DockSide::Right
+                                }
+                            });
+
+                            if let Some(side) = dock_side {
+                                let workspace = shell.active_space_mut(&output).unwrap();
+                                let (window, location) =
+                                    workspace.floating_layer.dock_window(grab_state.window, side);
+                                Some((window, location.to_global(&output)))
+                            } else {
                             // Place the window so that, rendered at its funnel scale around
                             // its own center, it lands exactly where it was drawn during the drag.
-                            let window_location = {
-                                let s = grab_state.funnel_scale();
-                                let size = grab_state.window.geometry().size.to_f64();
-                                let vc_x = grab_state.location.x
-                                    + (grab_state.window_offset.x as f64 + size.w / 2.0) * s;
-                                let vc_y = grab_state.location.y
-                                    + (grab_state.window_offset.y as f64 + size.h / 2.0) * s;
+                            let window_location =
                                 Point::<f64, Logical>::from((vc_x - size.w / 2.0, vc_y - size.h / 2.0))
                                     .to_i32_round()
-                                    .as_global()
-                            };
+                                    .as_global();
                             grab_state.window.set_geometry(Rectangle::new(
                                 window_location,
                                 grab_state.window.geometry().size.as_global(),
@@ -1054,6 +1090,7 @@ impl Drop for MoveGrab {
                                 }
                             }
                             Some((window, location.to_global(&output)))
+                            }
                         }
                     }
                 } else {
