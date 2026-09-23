@@ -1,0 +1,29 @@
+name: Sync master with upstream (pop-os/cosmic-comp)
+
+on:
+  schedule:
+    - cron: '0 4 * * *'   # daily at 04:00 UTC — edit to taste
+  workflow_dispatch: {}    # lets you also trigger it manually from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Reset master to upstream
+        run: |
+          git remote add upstream https://github.com/pop-os/cosmic-comp.git
+          git fetch upstream master
+          git checkout master
+          # master here is a pure mirror we never commit to ourselves, so a
+          # hard reset (not a merge) is fine and keeps this simple even if
+          # upstream force-pushes or rebases its own master.
+          git reset --hard upstream/master
+          git push --force-with-lease origin master
