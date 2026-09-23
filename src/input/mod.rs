@@ -2882,6 +2882,7 @@ impl State {
         output: &Output,
         shell: &Shell,
     ) -> Option<(PointerFocusTarget, Point<f64, Global>)> {
+        crate::shell::funnel::set_pointer_scale(1.0);
         let (previous_workspace, workspace) = shell.workspaces.active(output)?;
         let (previous_idx, idx) = shell.workspaces.active_num(output);
         let previous_workspace = previous_workspace

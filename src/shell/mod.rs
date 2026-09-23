@@ -98,6 +98,7 @@ use crate::{
 
 pub mod element;
 pub mod focus;
+pub mod funnel;
 pub mod grabs;
 pub mod layout;
 mod seats;

@@ -428,10 +428,12 @@ impl IsAlive for KeyboardFocusTarget {
 
 impl PointerTarget<State> for PointerFocusTarget {
     fn enter(&self, seat: &Seat<State>, data: &mut State, event: &PointerMotionEvent) {
+        let event = &crate::shell::funnel::unscale_motion(event);
         self.update_image_copy_cursor_position(seat, data, event);
         self.inner_pointer_target().enter(seat, data, event);
     }
     fn motion(&self, seat: &Seat<State>, data: &mut State, event: &PointerMotionEvent) {
+        let event = &crate::shell::funnel::unscale_motion(event);
         self.update_image_copy_cursor_position(seat, data, event);
         self.inner_pointer_target().motion(seat, data, event);
     }

@@ -81,6 +81,25 @@ pub struct MoveGrabState {
 }
 
 impl MoveGrabState {
+    /// Funnel scale of the dragged window. The window is shrunk around the
+    /// cursor, so its center (which decides the scale) itself depends on the
+    /// scale; a few fixed-point iterations converge because the field is flat
+    /// enough (|ds/dx| * distance cursor->center < 1 for normal window sizes).
+    fn funnel_scale(&self) -> f64 {
+        if self.previous != ManagedLayer::Floating {
+            return 1.0;
+        }
+        let out = self.cursor_output.geometry();
+        let size = self.window.geometry().size;
+        let mut s = 1.0;
+        for _ in 0..6 {
+            let cx = self.location.x + (self.window_offset.x as f64 + size.w as f64 / 2.0) * s
+                - out.loc.x as f64;
+            s = crate::shell::funnel::scale_at(cx, out.size.w as f64);
+        }
+        s
+    }
+
     #[profiling::function]
     pub fn render<R>(
         &self,
@@ -103,6 +122,7 @@ impl MoveGrabState {
         } else {
             1.0
         };
+        let scale = scale * self.funnel_scale();
         let alpha = if &self.cursor_output == output {
             1.0
         } else {
@@ -290,6 +310,7 @@ struct NotSend<T>(pub T);
 unsafe impl<T> Send for NotSend<T> {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // funnel prototype: left/right/corner zones are disabled for now
 pub enum SnappingZone {
     Maximize,
     Top,
@@ -427,10 +448,13 @@ impl MoveGrab {
                 let output_loc = output_geom.loc;
                 let output_size = output_geom.size;
 
-                grab_state.location.x = if (loc.x - output_loc.x).abs() < self.edge_snap_threshold {
+                grab_state.location.x = if self.previous != ManagedLayer::Floating
+                    && (loc.x - output_loc.x).abs() < self.edge_snap_threshold
+                {
                     output_loc.x - grab_state.window_offset.x as f64
-                } else if ((loc.x + size.w) - (output_loc.x + output_size.w)).abs()
-                    < self.edge_snap_threshold
+                } else if self.previous != ManagedLayer::Floating
+                    && ((loc.x + size.w) - (output_loc.x + output_size.w)).abs()
+                        < self.edge_snap_threshold
                 {
                     output_loc.x + output_size.w - grab_state.window_offset.x as f64 - size.w
                 } else {
@@ -487,13 +511,7 @@ impl MoveGrab {
                 grab_state.snapping_zone = [
                     SnappingZone::Maximize,
                     SnappingZone::Top,
-                    SnappingZone::TopLeft,
-                    SnappingZone::Left,
-                    SnappingZone::BottomLeft,
                     SnappingZone::Bottom,
-                    SnappingZone::BottomRight,
-                    SnappingZone::Right,
-                    SnappingZone::TopRight,
                 ]
                 .iter()
                 .find(|&x| {
@@ -958,6 +976,19 @@ impl Drop for MoveGrab {
                             Some((window, location.to_global(&output)))
                         }
                         _ => {
+                            // Place the window so that, rendered at its funnel scale around
+                            // its own center, it lands exactly where it was drawn during the drag.
+                            let window_location = {
+                                let s = grab_state.funnel_scale();
+                                let size = grab_state.window.geometry().size.to_f64();
+                                let vc_x = grab_state.location.x
+                                    + (grab_state.window_offset.x as f64 + size.w / 2.0) * s;
+                                let vc_y = grab_state.location.y
+                                    + (grab_state.window_offset.y as f64 + size.h / 2.0) * s;
+                                Point::<f64, Logical>::from((vc_x - size.w / 2.0, vc_y - size.h / 2.0))
+                                    .to_i32_round()
+                                    .as_global()
+                            };
                             grab_state.window.set_geometry(Rectangle::new(
                                 window_location,
                                 grab_state.window.geometry().size.as_global(),

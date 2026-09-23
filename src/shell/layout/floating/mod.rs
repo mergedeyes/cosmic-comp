@@ -21,7 +21,7 @@ use smithay::{
     desktop::{PopupKind, Space, WindowSurfaceType, layer_map_for_output, space::SpaceElement},
     input::Seat,
     output::Output,
-    utils::{IsAlive, Logical, Point, Rectangle, Scale, Size},
+    utils::{IsAlive, Logical, Physical, Point, Rectangle, Scale, Size},
     wayland::seat::WaylandFocus,
 };
 
@@ -743,40 +743,47 @@ impl FloatingLayout {
         self.space.element_geometry(elem).map(RectExt::as_local)
     }
 
+    /// Funnel transform of a (non-animating) floating element:
+    /// (center in output-local coordinates, uniform scale), or None at scale 1.
+    fn funnel_params(&self, elem: &CosmicMapped) -> Option<(Point<f64, Local>, f64)> {
+        if self.animations.contains_key(elem) {
+            return None;
+        }
+        let geo = self.space.element_geometry(elem)?.as_local();
+        let c: Point<f64, Local> = (
+            geo.loc.x as f64 + geo.size.w as f64 / 2.0,
+            geo.loc.y as f64 + geo.size.h as f64 / 2.0,
+        )
+            .into();
+        let s = crate::shell::funnel::scale_at(c.x, self.last_output_size.w as f64);
+        (s < 0.999).then_some((c, s))
+    }
+
     pub fn popup_element_under(
         &self,
         location: Point<f64, Local>,
         seat: &Seat<State>,
     ) -> Option<KeyboardFocusTarget> {
-        self.space
-            .elements()
-            .rev()
-            .map(|e| {
-                (
-                    e,
-                    self.space.element_location(e).unwrap() - e.geometry().loc,
-                )
-            })
-            .filter(|(e, render_location)| {
-                let mut bbox = e.bbox();
-                bbox.loc += *render_location;
-                bbox.to_f64().contains(location.as_logical())
-            })
-            .find_map(|(e, render_location)| {
-                let render_location = render_location.as_local().to_f64();
-                let point = location - render_location;
-                if e.focus_under(
-                    point.as_logical(),
-                    WindowSurfaceType::POPUP | WindowSurfaceType::SUBSURFACE,
-                    seat,
-                )
-                .is_some()
-                {
-                    Some(e.clone().into())
-                } else {
-                    None
-                }
-            })
+        self.space.elements().rev().find_map(|e| {
+            let offset = self.space.element_location(e).unwrap() - e.geometry().loc;
+            let render_location = offset.as_local().to_f64();
+            // Map the on-screen point back into the window's unscaled space.
+            let point = match self.funnel_params(e) {
+                Some((c, s)) => c + (location - c).downscale(s),
+                None => location,
+            };
+            let mut bbox = e.bbox();
+            bbox.loc += offset;
+            if !bbox.to_f64().contains(point.as_logical()) {
+                return None;
+            }
+            e.focus_under(
+                (point - render_location).as_logical(),
+                WindowSurfaceType::POPUP | WindowSurfaceType::SUBSURFACE,
+                seat,
+            )
+            .map(|_| e.clone().into())
+        })
     }
 
     pub fn toplevel_element_under(
@@ -784,35 +791,26 @@ impl FloatingLayout {
         location: Point<f64, Local>,
         seat: &Seat<State>,
     ) -> Option<KeyboardFocusTarget> {
-        self.space
-            .elements()
-            .rev()
-            .map(|e| {
-                (
-                    e,
-                    self.space.element_location(e).unwrap() - e.geometry().loc,
-                )
-            })
-            .filter(|(e, render_location)| {
-                let mut bbox = e.bbox();
-                bbox.loc += *render_location;
-                bbox.to_f64().contains(location.as_logical())
-            })
-            .find_map(|(e, render_location)| {
-                let render_location = render_location.as_local().to_f64();
-                let point = location - render_location;
-                if e.focus_under(
-                    point.as_logical(),
-                    WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE,
-                    seat,
-                )
-                .is_some()
-                {
-                    Some(e.clone().into())
-                } else {
-                    None
-                }
-            })
+        self.space.elements().rev().find_map(|e| {
+            let offset = self.space.element_location(e).unwrap() - e.geometry().loc;
+            let render_location = offset.as_local().to_f64();
+            // Map the on-screen point back into the window's unscaled space.
+            let point = match self.funnel_params(e) {
+                Some((c, s)) => c + (location - c).downscale(s),
+                None => location,
+            };
+            let mut bbox = e.bbox();
+            bbox.loc += offset;
+            if !bbox.to_f64().contains(point.as_logical()) {
+                return None;
+            }
+            e.focus_under(
+                (point - render_location).as_logical(),
+                WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE,
+                seat,
+            )
+            .map(|_| e.clone().into())
+        })
     }
 
     pub fn popup_surface_under(
@@ -820,32 +818,38 @@ impl FloatingLayout {
         location: Point<f64, Local>,
         seat: &Seat<State>,
     ) -> Option<(PointerFocusTarget, Point<f64, Local>)> {
-        self.space
-            .elements()
-            .rev()
-            .map(|e| {
-                (
-                    e,
-                    self.space.element_location(e).unwrap() - e.geometry().loc,
-                )
+        self.space.elements().rev().find_map(|e| {
+            let offset = self.space.element_location(e).unwrap() - e.geometry().loc;
+            let render_location = offset.as_local().to_f64();
+            let funnel = self.funnel_params(e);
+            // Map the on-screen point back into the window's unscaled space.
+            let point = match funnel {
+                Some((c, s)) => c + (location - c).downscale(s),
+                None => location,
+            };
+            let mut bbox = e.bbox();
+            bbox.loc += offset;
+            if !bbox.to_f64().contains(point.as_logical()) {
+                return None;
+            }
+            e.focus_under(
+                (point - render_location).as_logical(),
+                WindowSurfaceType::POPUP | WindowSurfaceType::SUBSURFACE,
+                seat,
+            )
+            .map(|(surface, surface_offset)| {
+                let origin = render_location + surface_offset.as_local();
+                match funnel {
+                    // Report the *scaled* on-screen origin; the scale itself is
+                    // divided out again in PointerFocusTarget::motion.
+                    Some((c, s)) => {
+                        crate::shell::funnel::set_pointer_scale(s);
+                        (surface, c + (origin - c).upscale(s))
+                    }
+                    None => (surface, origin),
+                }
             })
-            .filter(|(e, render_location)| {
-                let mut bbox = e.bbox();
-                bbox.loc += *render_location;
-                bbox.to_f64().contains(location.as_logical())
-            })
-            .find_map(|(e, render_location)| {
-                let render_location = render_location.as_local().to_f64();
-                let point = location - render_location;
-                e.focus_under(
-                    point.as_logical(),
-                    WindowSurfaceType::POPUP | WindowSurfaceType::SUBSURFACE,
-                    seat,
-                )
-                .map(|(surface, surface_offset)| {
-                    (surface, render_location + surface_offset.as_local())
-                })
-            })
+        })
     }
 
     pub fn toplevel_surface_under(
@@ -853,32 +857,38 @@ impl FloatingLayout {
         location: Point<f64, Local>,
         seat: &Seat<State>,
     ) -> Option<(PointerFocusTarget, Point<f64, Local>)> {
-        self.space
-            .elements()
-            .rev()
-            .map(|e| {
-                (
-                    e,
-                    self.space.element_location(e).unwrap() - e.geometry().loc,
-                )
+        self.space.elements().rev().find_map(|e| {
+            let offset = self.space.element_location(e).unwrap() - e.geometry().loc;
+            let render_location = offset.as_local().to_f64();
+            let funnel = self.funnel_params(e);
+            // Map the on-screen point back into the window's unscaled space.
+            let point = match funnel {
+                Some((c, s)) => c + (location - c).downscale(s),
+                None => location,
+            };
+            let mut bbox = e.bbox();
+            bbox.loc += offset;
+            if !bbox.to_f64().contains(point.as_logical()) {
+                return None;
+            }
+            e.focus_under(
+                (point - render_location).as_logical(),
+                WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE,
+                seat,
+            )
+            .map(|(surface, surface_offset)| {
+                let origin = render_location + surface_offset.as_local();
+                match funnel {
+                    // Report the *scaled* on-screen origin; the scale itself is
+                    // divided out again in PointerFocusTarget::motion.
+                    Some((c, s)) => {
+                        crate::shell::funnel::set_pointer_scale(s);
+                        (surface, c + (origin - c).upscale(s))
+                    }
+                    None => (surface, origin),
+                }
             })
-            .filter(|(e, render_location)| {
-                let mut bbox = e.bbox();
-                bbox.loc += *render_location;
-                bbox.to_f64().contains(location.as_logical())
-            })
-            .find_map(|(e, render_location)| {
-                let render_location = render_location.as_local().to_f64();
-                let point = location - render_location;
-                e.focus_under(
-                    point.as_logical(),
-                    WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE,
-                    seat,
-                )
-                .map(|(surface, surface_offset)| {
-                    (surface, render_location + surface_offset.as_local())
-                })
-            })
+        })
     }
 
     pub fn update_pointer_position(&mut self, location: Option<Point<f64, Local>>) {
@@ -1469,6 +1479,27 @@ impl FloatingLayout {
                 .unwrap_or_else(|| (self.space.element_geometry(elem).unwrap().as_local(), alpha));
 
             let render_location = geometry.loc - elem.geometry().loc.as_local();
+            let funnel = self.funnel_params(elem).map(|(c, s)| {
+                let origin: Point<i32, Physical> =
+                    c.as_logical().to_physical_precise_round(output_scale);
+                move |element| match element {
+                    CosmicMappedRenderElement::Stack(elem) => {
+                        CosmicMappedRenderElement::MovingStack(RelocateRenderElement::from_element(
+                            RescaleRenderElement::from_element(elem, origin, Scale::from(s)),
+                            Point::<i32, Physical>::from((0, 0)),
+                            Relocate::Relative,
+                        ))
+                    }
+                    CosmicMappedRenderElement::Window(elem) => {
+                        CosmicMappedRenderElement::MovingWindow(RelocateRenderElement::from_element(
+                            RescaleRenderElement::from_element(elem, origin, Scale::from(s)),
+                            Point::<i32, Physical>::from((0, 0)),
+                            Relocate::Relative,
+                        ))
+                    }
+                    x => x,
+                }
+            });
             elem.push_popup_render_elements(
                 renderer,
                 render_location
@@ -1477,7 +1508,10 @@ impl FloatingLayout {
                 output_scale.into(),
                 alpha,
                 scanout_node,
-                push,
+                &mut |element| match funnel {
+                    Some(map) => push(map(element)),
+                    None => push(element),
+                },
             );
         }
     }
@@ -1522,70 +1556,88 @@ impl FloatingLayout {
                 .unwrap_or_else(|| (self.space.element_geometry(elem).unwrap().as_local(), alpha));
             let render_location = geometry.loc - elem.geometry().loc.as_local();
 
-            let maybe_map = if let Some(anim) = self.animations.get(elem) {
-                let original_geo = anim.previous_geometry();
-                geometry = anim.geometry(
-                    output_geometry,
-                    self.space
-                        .element_geometry(elem)
-                        .map(RectExt::as_local)
-                        .unwrap_or(geometry),
-                    elem.floating_tiled.lock().unwrap().as_ref(),
-                    self.gaps(),
-                );
+            // (origin, scale, offset) applied via RescaleRenderElement + RelocateRenderElement.
+            let transform: Option<(Point<i32, Physical>, Scale<f64>, Point<i32, Physical>)> =
+                if let Some(anim) = self.animations.get(elem) {
+                    let original_geo = anim.previous_geometry();
+                    geometry = anim.geometry(
+                        output_geometry,
+                        self.space
+                            .element_geometry(elem)
+                            .map(RectExt::as_local)
+                            .unwrap_or(geometry),
+                        elem.floating_tiled.lock().unwrap().as_ref(),
+                        self.gaps(),
+                    );
 
-                let buffer_size = elem.geometry().size;
-                let scale = Scale {
-                    x: geometry.size.w as f64 / buffer_size.w as f64,
-                    y: geometry.size.h as f64 / buffer_size.h as f64,
+                    let buffer_size = elem.geometry().size;
+                    let scale = Scale {
+                        x: geometry.size.w as f64 / buffer_size.w as f64,
+                        y: geometry.size.h as f64 / buffer_size.h as f64,
+                    };
+
+                    Some((
+                        original_geo
+                            .loc
+                            .as_logical()
+                            .to_physical_precise_round(output_scale),
+                        scale,
+                        (geometry.loc - original_geo.loc)
+                            .as_logical()
+                            .to_physical_precise_round(output_scale),
+                    ))
+                } else {
+                    // Funnel: render-only uniform scale depending on horizontal position.
+                    // The client is not told about this; its buffer size stays the same.
+                    let center_x = geometry.loc.x as f64 + geometry.size.w as f64 / 2.0;
+                    let center_y = geometry.loc.y as f64 + geometry.size.h as f64 / 2.0;
+                    let s = crate::shell::funnel::scale_at(
+                        center_x,
+                        self.last_output_size.w as f64,
+                    );
+                    if s < 0.999 {
+                        let w = (geometry.size.w as f64 * s).round() as i32;
+                        let h = (geometry.size.h as f64 * s).round() as i32;
+                        // Shrunken rectangle around the same center, so focus and
+                        // resize indicators follow the visible window.
+                        geometry = Rectangle::new(
+                            (
+                                (center_x - w as f64 / 2.0).round() as i32,
+                                (center_y - h as f64 / 2.0).round() as i32,
+                            )
+                                .into(),
+                            (w, h).into(),
+                        );
+                        let center: Point<f64, Local> = (center_x, center_y).into();
+                        Some((
+                            center.as_logical().to_physical_precise_round(output_scale),
+                            Scale::from(s),
+                            (0, 0).into(),
+                        ))
+                    } else {
+                        None
+                    }
                 };
 
-                Some(move |element| match element {
+            let maybe_map = transform.map(|(origin, scale, offset)| {
+                move |element| match element {
                     CosmicMappedRenderElement::Stack(elem) => {
-                        CosmicMappedRenderElement::MovingStack({
-                            let rescaled = RescaleRenderElement::from_element(
-                                elem,
-                                original_geo
-                                    .loc
-                                    .as_logical()
-                                    .to_physical_precise_round(output_scale),
-                                scale,
-                            );
-
-                            RelocateRenderElement::from_element(
-                                rescaled,
-                                (geometry.loc - original_geo.loc)
-                                    .as_logical()
-                                    .to_physical_precise_round(output_scale),
-                                Relocate::Relative,
-                            )
-                        })
+                        CosmicMappedRenderElement::MovingStack(RelocateRenderElement::from_element(
+                            RescaleRenderElement::from_element(elem, origin, scale),
+                            offset,
+                            Relocate::Relative,
+                        ))
                     }
                     CosmicMappedRenderElement::Window(elem) => {
-                        CosmicMappedRenderElement::MovingWindow({
-                            let rescaled = RescaleRenderElement::from_element(
-                                elem,
-                                original_geo
-                                    .loc
-                                    .as_logical()
-                                    .to_physical_precise_round(output_scale),
-                                scale,
-                            );
-
-                            RelocateRenderElement::from_element(
-                                rescaled,
-                                (geometry.loc - original_geo.loc)
-                                    .as_logical()
-                                    .to_physical_precise_round(output_scale),
-                                Relocate::Relative,
-                            )
-                        })
+                        CosmicMappedRenderElement::MovingWindow(RelocateRenderElement::from_element(
+                            RescaleRenderElement::from_element(elem, origin, scale),
+                            offset,
+                            Relocate::Relative,
+                        ))
                     }
                     x => x,
-                })
-            } else {
-                None
-            };
+                }
+            });
 
             if focused == Some(elem) && !elem.is_maximized(false) {
                 let active_window_hint = crate::theme::active_window_hint(theme);
