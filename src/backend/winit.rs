@@ -146,6 +146,36 @@ impl WinitState {
     }
 }
 
+/// Funnel prototype: simulate a monitor wider (or narrower) than the nested
+/// window's real, physical size. The window itself can never be resized past
+/// your actual screen -- the window manager won't allow it -- but the funnel
+/// math only reads the output's *logical* width, and that's just physical
+/// width divided by the output's scale factor. Fractional HiDPI scaling
+/// normally uses a scale > 1 to fit *more* physical pixels into the same
+/// logical space; this runs it the other way, with a scale < 1, to make a
+/// modest physical window represent a wider logical canvas than it actually
+/// has pixels for -- exactly like zooming out on a bigger virtual monitor.
+///
+/// Set `COSMIC_FUNNEL_SIM_WIDTH` to the logical width (in "monitor pixels")
+/// you want to simulate, e.g. `COSMIC_FUNNEL_SIM_WIDTH=5120` for a 5120-wide
+/// ultrawide. Resize the nested window to whatever *aspect ratio* you want to
+/// test (it'll easily fit your real screen, since it's just a shape, not the
+/// final size) -- the simulated monitor's logical height follows from that
+/// shape automatically. Recomputed on every resize, so this stays correct as
+/// you drag the window around.
+fn funnel_sim_scale(physical_width: i32) -> Scale {
+    let target = std::env::var("COSMIC_FUNNEL_SIM_WIDTH")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|w| *w > 0.0);
+    match target {
+        Some(target_w) if physical_width > 0 => {
+            Scale::Fractional(physical_width as f64 / target_w)
+        }
+        _ => Scale::Integer(1),
+    }
+}
+
 pub fn init_backend(
     dh: &DisplayHandle,
     event_loop: &mut EventLoop<State>,
@@ -153,6 +183,22 @@ pub fn init_backend(
 ) -> Result<()> {
     let (mut backend, mut input): (WinitGraphicsBackend<GlowRenderer>, _) =
         winit::init().map_err(|e| anyhow!("Failed to initilize winit backend: {e:?}"))?;
+
+    // Funnel prototype: simulate an ultrawide (or any other) monitor size without
+    // dragging the nested window's edge by hand. Format: "WIDTHxHEIGHT" in logical
+    // pixels, e.g. `COSMIC_FUNNEL_SIM_SIZE=5120x1440`. The actual resize completes
+    // asynchronously (this is Wayland) and is picked up like any other resize by
+    // the `WinitEvent::Resized` handler below, which updates the output `Mode` that
+    // the funnel math reads its width from.
+    if let Some((w, h)) = std::env::var("COSMIC_FUNNEL_SIM_SIZE").ok().and_then(|v| {
+        let (w, h) = v.split_once('x')?;
+        Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+    }) {
+        let _ = backend.window().request_surface_size(
+            smithay::reexports::winit::dpi::LogicalSize::new(w, h).into(),
+        );
+    }
+
     init_shaders(backend.renderer().borrow_mut()).context("Failed to initialize renderer")?;
 
     init_egl_client_side(dh, state, &mut backend)?;
@@ -176,7 +222,7 @@ pub fn init_backend(
     output.change_current_state(
         Some(mode),
         Some(Transform::Flipped180),
-        Some(Scale::Integer(1)),
+        Some(funnel_sim_scale(size.w)),
         Some((0, 0).into()),
     );
     output.user_data().insert_if_missing(|| {
@@ -332,6 +378,8 @@ impl State {
                 }
             }
             WinitEvent::Resized { size, .. } => {
+                let scale = funnel_sim_scale(size.w);
+                info!(?size, ?scale, "funnel: nested window resized");
                 let winit_state = self.backend.winit();
                 let output = &winit_state.output;
                 let mode = Mode {
@@ -349,7 +397,11 @@ impl State {
                 }
                 output.delete_mode(output.current_mode().unwrap());
                 output.set_preferred(mode);
-                output.change_current_state(Some(mode), None, None, None);
+                output.change_current_state(Some(mode), None, Some(scale), None);
+                info!(
+                    logical = ?output.geometry().size,
+                    "funnel: output geometry after resize"
+                );
                 layer_map_for_output(output).arrange();
                 self.common.output_configuration_state.update();
                 render_ping.ping();

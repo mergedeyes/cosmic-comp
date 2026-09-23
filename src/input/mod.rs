@@ -875,13 +875,8 @@ impl State {
                                 shell.element_for_surface(&*surface).is_some_and(|elem| {
                                     shell
                                         .space_for(elem)
-                                        .and_then(|w| w.floating_layer.funnel_scale_of(elem))
-                                        .is_some_and(|s| {
-                                            crate::shell::funnel::is_move_anywhere(
-                                                smithay::desktop::space::SpaceElement::geometry(elem).size.w,
-                                                s,
-                                            )
-                                        })
+                                        .and_then(|w| w.floating_layer.funnel_falloff_of(elem))
+                                        .is_some_and(crate::shell::funnel::is_move_anywhere)
                                 })
                             });
                             if let Some(surface) = target.toplevel().map(Cow::into_owned)

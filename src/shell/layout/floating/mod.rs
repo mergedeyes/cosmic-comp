@@ -799,20 +799,26 @@ impl FloatingLayout {
     }
 
     /// Recompute and apply the geometry of every window currently docked on
-    /// `side`, in order, stacked from the top of the output with `DOCK_GAP`
-    /// between slots. A docked window's x places its *center* exactly on (or
-    /// past) the output edge, which is what already gives it `MIN_SCALE` in
-    /// the funnel render/hit-testing code -- docking needs no separate
-    /// render path, only this placement.
+    /// `side`, in order, stacked from the top of the output with
+    /// `dock_padding` between slots (the same value used for the edge
+    /// padding, so both scale together with `DOCK_MAX_SIZE_FRACTION`).
+    /// Placement here only decides *position*; a docked
+    /// window's *size* comes from `dock_scale` (via `funnel_scale_for`,
+    /// checked against `docked_left`/`docked_right` membership) rather than
+    /// from wherever this position falls in the ordinary falloff field --
+    /// docking still needs no separate render path, just this placement plus
+    /// that membership check.
     fn reflow_docked(&mut self, side: crate::shell::funnel::DockSide) {
-        use crate::shell::funnel::DockSide;
+        use crate::shell::funnel::{DockSide, dock_padding, dock_scale};
 
         let list = match side {
             DockSide::Left => self.docked_left.clone(),
             DockSide::Right => self.docked_right.clone(),
         };
         let output = self.space.outputs().next().unwrap().clone();
-        let mut y_offset = 0;
+        let funnel_width = self.funnel_output_width();
+        let padding = dock_padding(self.funnel_output_height());
+        let mut visible_top = padding;
         for w in list {
             if !w.alive() {
                 continue;
@@ -821,15 +827,46 @@ impl FloatingLayout {
                 let layers = layer_map_for_output(&output);
                 layers.non_exclusive_zone()
             };
-            let size = w.geometry().size;
-            let x = match side {
-                DockSide::Left => -(size.w / 2),
-                DockSide::Right => output_geometry.loc.x + output_geometry.size.w - size.w / 2,
+            let native_w = w.geometry().size.w as f64;
+            let native_h = w.geometry().size.h as f64;
+            let s = dock_scale(native_w, native_h, self.funnel_output_height());
+            let shrunk_w = native_w * s;
+            let shrunk_h = native_h * s;
+
+            // Position stores the window's *native* (unscaled) top-left --
+            // rendering shrinks it by `s` around its native center, so we
+            // have to work backwards from where we want the *visible*
+            // (shrunk) rect to end up to the native top-left that produces
+            // it: visible_edge = center +/- shrunk_size/2, center = native
+            // top-left + native_size/2.
+            let visible_left = match side {
+                DockSide::Left => padding,
+                DockSide::Right => funnel_width - padding - shrunk_w,
             };
-            let position = Point::<i32, Local>::from((x, output_geometry.loc.y + y_offset));
-            self.map_internal(w.clone(), Some(position), None, None);
-            y_offset += (size.h as f64 * crate::shell::funnel::MIN_SCALE).round() as i32
-                + crate::shell::funnel::DOCK_GAP;
+            let x = (visible_left + shrunk_w / 2.0 - native_w / 2.0).round() as i32;
+            let y = (visible_top + shrunk_h / 2.0 - native_h / 2.0).round() as i32;
+            let position = Point::<i32, Local>::from((x, output_geometry.loc.y + y));
+
+            // Reposition directly instead of going through `map_internal`:
+            // that inserts an `Animation::Tiled` entry whenever the window
+            // already has a previous geometry (true for any sibling being
+            // shifted to fill a gap), and that animation's renderer derives
+            // scale purely from new_size/buffer_size -- since a dock reflow
+            // only ever changes *position*, never native size, that ratio is
+            // always 1.0, so the window would flash at full native size for
+            // the animation's duration instead of staying at its dock_scale
+            // size. `set_geometry` still has to run (not just `map_element`)
+            // so `elem.geometry().loc` stays in sync with the space position
+            // -- render() computes `render_location` as the difference
+            // between the two, and a stale one would misplace the window's
+            // rendered content and its popups.
+            let win_geo = w.geometry().as_local();
+            w.set_geometry(Rectangle::new(position, win_geo.size).to_global(&output));
+            w.configure();
+            self.space.map_element(w.clone(), position.as_logical(), false);
+            self.space.refresh();
+
+            visible_top += shrunk_h + padding;
         }
     }
 
@@ -848,14 +885,60 @@ impl FloatingLayout {
             .unwrap_or(self.last_output_size.w as f64)
     }
 
-    /// Funnel scale of a floating element, or None if it is drawn at full size.
-    pub fn funnel_scale_of(&self, elem: &CosmicMapped) -> Option<f64> {
-        self.funnel_params(elem).map(|(_, s)| s)
+    /// Height counterpart to `funnel_output_width`, used for docked-slot sizing
+    /// (`dock_scale`), which is deliberately based on output height, not width.
+    fn funnel_output_height(&self) -> f64 {
+        self.space
+            .outputs()
+            .next()
+            .map(|o| o.geometry().size.h as f64)
+            .unwrap_or(self.last_output_size.h as f64)
     }
 
-    /// Funnel transform of a (non-animating) floating element:
-    /// (center in output-local coordinates, uniform scale), or None at scale 1.
-    fn funnel_params(&self, elem: &CosmicMapped) -> Option<(Point<f64, Local>, f64)> {
+    /// Funnel scale of a floating element, or None if it is drawn at full size.
+    pub fn funnel_scale_of(&self, elem: &CosmicMapped) -> Option<f64> {
+        self.funnel_params(elem).map(|(_, s, _)| s)
+    }
+
+    /// Edge-falloff progress of a floating element (0..1, see
+    /// `funnel::falloff_at`), or None if it is drawn at full size. This is
+    /// what `is_move_anywhere`/`is_dockable` should be checked against, not
+    /// the raw scale -- scale is per-window (`dock_scale`) since docking was
+    /// made size-consistent, so a fixed scale threshold no longer means the
+    /// same thing for every window, but falloff progress still does.
+    pub fn funnel_falloff_of(&self, elem: &CosmicMapped) -> Option<f64> {
+        self.funnel_params(elem).map(|(_, _, d)| d)
+    }
+
+    /// The scale a window of `elem`'s native size ends up at fully docked, or
+    /// fully at the edge of a live drag -- one formula for both (see
+    /// `funnel::dock_scale`'s docs), so nothing jumps size when it docks or
+    /// is picked back up.
+    fn funnel_min_scale_for(&self, elem: &CosmicMapped) -> f64 {
+        let size = elem.geometry().size;
+        crate::shell::funnel::dock_scale(size.w as f64, size.h as f64, self.funnel_output_height())
+    }
+
+    /// The scale a floating element should render/hit-test at: docked windows
+    /// sit fixed at their own `dock_scale`; everything else uses the ordinary
+    /// position-based falloff between 1.0 and that same `dock_scale` value.
+    fn funnel_scale_for(&self, elem: &CosmicMapped, center_x: f64) -> f64 {
+        let min_scale = self.funnel_min_scale_for(elem);
+        if self.docked_left.contains(elem) || self.docked_right.contains(elem) {
+            min_scale
+        } else {
+            crate::shell::funnel::scale_at(center_x, self.funnel_output_width(), min_scale)
+        }
+    }
+
+    /// Funnel transform of a (non-animating) floating element: (center in
+    /// output-local coordinates, uniform scale, edge-falloff progress), or
+    /// None if it's fully in the middle third (falloff progress 0, drawn at
+    /// native size). Gated on falloff progress rather than the resulting
+    /// scale, since a window already smaller than the docked-slot cap can
+    /// have `min_scale` clamped to 1.0 (nothing left to shrink) while still
+    /// very much being at the edge positionally.
+    fn funnel_params(&self, elem: &CosmicMapped) -> Option<(Point<f64, Local>, f64, f64)> {
         if self.animations.contains_key(elem) {
             return None;
         }
@@ -865,8 +948,13 @@ impl FloatingLayout {
             geo.loc.y as f64 + geo.size.h as f64 / 2.0,
         )
             .into();
-        let s = crate::shell::funnel::scale_at(c.x, self.funnel_output_width());
-        (s < 0.999).then_some((c, s))
+        let s = self.funnel_scale_for(elem, c.x);
+        let d = if self.docked_left.contains(elem) || self.docked_right.contains(elem) {
+            1.0
+        } else {
+            crate::shell::funnel::falloff_at(c.x, self.funnel_output_width())
+        };
+        (d > 0.0).then_some((c, s, d))
     }
 
     pub fn popup_element_under(
@@ -879,7 +967,7 @@ impl FloatingLayout {
             let render_location = offset.as_local().to_f64();
             // Map the on-screen point back into the window's unscaled space.
             let point = match self.funnel_params(e) {
-                Some((c, s)) => c + (location - c).downscale(s),
+                Some((c, s, _)) => c + (location - c).downscale(s),
                 None => location,
             };
             let mut bbox = e.bbox();
@@ -906,7 +994,7 @@ impl FloatingLayout {
             let render_location = offset.as_local().to_f64();
             // Map the on-screen point back into the window's unscaled space.
             let point = match self.funnel_params(e) {
-                Some((c, s)) => c + (location - c).downscale(s),
+                Some((c, s, _)) => c + (location - c).downscale(s),
                 None => location,
             };
             let mut bbox = e.bbox();
@@ -934,7 +1022,7 @@ impl FloatingLayout {
             let funnel = self.funnel_params(e);
             // Map the on-screen point back into the window's unscaled space.
             let point = match funnel {
-                Some((c, s)) => c + (location - c).downscale(s),
+                Some((c, s, _)) => c + (location - c).downscale(s),
                 None => location,
             };
             let mut bbox = e.bbox();
@@ -952,7 +1040,7 @@ impl FloatingLayout {
                 match funnel {
                     // Report the *scaled* on-screen origin; the scale itself is
                     // divided out again in PointerFocusTarget::motion.
-                    Some((c, s)) => {
+                    Some((c, s, _)) => {
                         crate::shell::funnel::set_pointer_scale(s);
                         (surface, c + (origin - c).upscale(s))
                     }
@@ -973,7 +1061,7 @@ impl FloatingLayout {
             let funnel = self.funnel_params(e);
             // Map the on-screen point back into the window's unscaled space.
             let point = match funnel {
-                Some((c, s)) => c + (location - c).downscale(s),
+                Some((c, s, _)) => c + (location - c).downscale(s),
                 None => location,
             };
             let mut bbox = e.bbox();
@@ -991,7 +1079,7 @@ impl FloatingLayout {
                 match funnel {
                     // Report the *scaled* on-screen origin; the scale itself is
                     // divided out again in PointerFocusTarget::motion.
-                    Some((c, s)) => {
+                    Some((c, s, _)) => {
                         crate::shell::funnel::set_pointer_scale(s);
                         (surface, c + (origin - c).upscale(s))
                     }
@@ -1589,7 +1677,7 @@ impl FloatingLayout {
                 .unwrap_or_else(|| (self.space.element_geometry(elem).unwrap().as_local(), alpha));
 
             let render_location = geometry.loc - elem.geometry().loc.as_local();
-            let funnel = self.funnel_params(elem).map(|(c, s)| {
+            let funnel = self.funnel_params(elem).map(|(c, s, _)| {
                 let origin: Point<i32, Physical> =
                     c.as_logical().to_physical_precise_round(output_scale);
                 move |element| match element {
@@ -1697,14 +1785,12 @@ impl FloatingLayout {
                             .to_physical_precise_round(output_scale),
                     ))
                 } else {
-                    // Funnel: render-only uniform scale depending on horizontal position.
-                    // The client is not told about this; its buffer size stays the same.
+                    // Funnel: render-only uniform scale, either position-based
+                    // falloff or a docked window's fixed slot size. The client is
+                    // not told about this; its buffer size stays the same.
                     let center_x = geometry.loc.x as f64 + geometry.size.w as f64 / 2.0;
                     let center_y = geometry.loc.y as f64 + geometry.size.h as f64 / 2.0;
-                    let s = crate::shell::funnel::scale_at(
-                        center_x,
-                        self.funnel_output_width(),
-                    );
+                    let s = self.funnel_scale_for(elem, center_x);
                     if s < 0.999 {
                         let w = (geometry.size.w as f64 * s).round() as i32;
                         let h = (geometry.size.h as f64 * s).round() as i32;
@@ -1751,12 +1837,20 @@ impl FloatingLayout {
 
             // Funnel: windows too small to use only accept moves; mark them with a
             // blue outline (instead of the normal focus hint, so the meaning is clear).
-            let move_only = self.funnel_scale_of(elem).is_some_and(|s| {
-                crate::shell::funnel::is_move_anywhere(elem.geometry().size.w, s)
-            });
-            if move_only {
-                let thickness =
-                    indicator_thickness.max(crate::shell::funnel::MOVE_ONLY_THICKNESS);
+            // Actually-docked windows get their own thinner, grey outline instead --
+            // a resting dock slot reads as a calmer state than "shrunk and
+            // click-through somewhere in the funnel's outer zone."
+            let docked = self.docked_left.contains(elem) || self.docked_right.contains(elem);
+            let move_only = self
+                .funnel_falloff_of(elem)
+                .is_some_and(crate::shell::funnel::is_move_anywhere);
+            if docked || move_only {
+                let (base_thickness, color) = if docked {
+                    (crate::shell::funnel::DOCKED_THICKNESS, crate::shell::funnel::DOCKED_COLOR)
+                } else {
+                    (crate::shell::funnel::MOVE_ONLY_THICKNESS, crate::shell::funnel::MOVE_ONLY_COLOR)
+                };
+                let thickness = indicator_thickness.max(base_thickness);
                 let radius = elem.corner_radius(geometry.size.as_logical(), thickness);
                 push(
                     IndicatorShader::focus_element(
@@ -1767,7 +1861,7 @@ impl FloatingLayout {
                         radius,
                         alpha,
                         output_scale,
-                        crate::shell::funnel::MOVE_ONLY_COLOR,
+                        color,
                     )
                     .into(),
                 );

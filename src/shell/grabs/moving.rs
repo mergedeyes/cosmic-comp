@@ -81,23 +81,44 @@ pub struct MoveGrabState {
 }
 
 impl MoveGrabState {
-    /// Funnel scale of the dragged window. The window is shrunk around the
-    /// cursor, so its center (which decides the scale) itself depends on the
-    /// scale; a few fixed-point iterations converge because the field is flat
-    /// enough (|ds/dx| * distance cursor->center < 1 for normal window sizes).
-    fn funnel_scale(&self) -> f64 {
+    /// Funnel scale and edge-falloff progress of the dragged window,
+    /// together (see `crate::shell::funnel::falloff_at`/`is_move_anywhere`/
+    /// `is_dockable` for why progress, not raw scale, is what threshold
+    /// checks should use). The window is shrunk around the cursor, so its
+    /// center (which decides the scale) itself depends on the scale; a few
+    /// fixed-point iterations converge because the field is flat enough
+    /// (|ds/dx| * distance cursor->center < 1 for normal window sizes). The
+    /// scale floors out at this window's own `dock_scale` -- the same value
+    /// it's drawn at once actually docked -- so nothing jumps size at the
+    /// moment a drag starts or ends near the edge.
+    fn funnel_transform(&self) -> (f64, f64) {
         if self.previous != ManagedLayer::Floating {
-            return 1.0;
+            return (1.0, 0.0);
         }
         let out = self.cursor_output.geometry();
         let size = self.window.geometry().size;
+        let min_scale = crate::shell::funnel::dock_scale(
+            size.w as f64,
+            size.h as f64,
+            out.size.h as f64,
+        );
         let mut s = 1.0;
+        let mut cx = 0.0;
         for _ in 0..6 {
-            let cx = self.location.x + (self.window_offset.x as f64 + size.w as f64 / 2.0) * s
+            cx = self.location.x + (self.window_offset.x as f64 + size.w as f64 / 2.0) * s
                 - out.loc.x as f64;
-            s = crate::shell::funnel::scale_at(cx, out.size.w as f64);
+            s = crate::shell::funnel::scale_at(cx, out.size.w as f64, min_scale);
         }
-        s
+        let d = crate::shell::funnel::falloff_at(cx, out.size.w as f64);
+        (s, d)
+    }
+
+    fn funnel_scale(&self) -> f64 {
+        self.funnel_transform().0
+    }
+
+    fn funnel_falloff(&self) -> f64 {
+        self.funnel_transform().1
     }
 
     #[profiling::function]
@@ -191,10 +212,7 @@ impl MoveGrabState {
                     radius,
                     alpha,
                     output_scale.x,
-                    if crate::shell::funnel::is_move_anywhere(
-                        self.window.geometry().size.w,
-                        scale,
-                    ) {
+                    if crate::shell::funnel::is_move_anywhere(self.funnel_falloff()) {
                         crate::shell::funnel::MOVE_ONLY_COLOR
                     } else {
                         [
@@ -985,8 +1003,10 @@ impl Drop for MoveGrab {
                         _ => {
                             // Funnel scale + visual center the window would be drawn at if
                             // dropped right here (both needed either way: to decide docking,
-                            // or to place it normally below).
-                            let s = grab_state.funnel_scale();
+                            // or to place it normally below), plus edge-falloff progress to
+                            // decide docking itself (see funnel_transform's docs for why that's
+                            // progress, not the scale `s`).
+                            let (s, d) = grab_state.funnel_transform();
                             let size = grab_state.window.geometry().size.to_f64();
                             let vc_x = grab_state.location.x
                                 + (grab_state.window_offset.x as f64 + size.w / 2.0) * s;
@@ -999,10 +1019,7 @@ impl Drop for MoveGrab {
                             // wherever it was dropped.
                             let dock_side = (matches!(previous, ManagedLayer::Floating)
                                 && grab_state.snapping_zone.is_none()
-                                && crate::shell::funnel::is_dockable(
-                                    grab_state.window.geometry().size.w,
-                                    s,
-                                ))
+                                && crate::shell::funnel::is_dockable(d))
                             .then(|| {
                                 let output_geom = output.geometry().to_f64().as_logical();
                                 let mid_x = output_geom.loc.x + output_geom.size.w / 2.0;
